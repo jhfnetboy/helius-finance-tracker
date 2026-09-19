@@ -21,7 +21,7 @@ use crate::model::{
     UpdatePlanningScenario, UpdateRecurringRule, UpdateTransaction, Weekday, WeeklyBalancePoint,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 pub struct Db {
     conn: Connection,
@@ -243,11 +243,23 @@ impl Db {
         kind: &AccountKind,
         opening_balance_cents: i64,
         opened_on: &str,
+        currency: Option<&str>,
+        owner: Option<&str>,
     ) -> Result<i64, AppError> {
         let normalized_name = normalize_name("account", name)?;
+        let currency = normalize_optional_currency(currency)?;
+        let owner = normalize_owner(owner);
         match self.conn.execute(
-            "INSERT INTO accounts (name, kind, opening_balance_cents, opened_on) VALUES (?1, ?2, ?3, ?4)",
-            params![normalized_name, kind.as_db_str(), opening_balance_cents, opened_on],
+            "INSERT INTO accounts (name, kind, opening_balance_cents, opened_on, currency, owner)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                normalized_name,
+                kind.as_db_str(),
+                opening_balance_cents,
+                opened_on,
+                currency,
+                owner
+            ],
         ) {
             Ok(_) => Ok(self.conn.last_insert_rowid()),
             Err(error) if is_unique_constraint(&error) => {
@@ -259,7 +271,7 @@ impl Db {
 
     pub fn list_accounts(&self) -> Result<Vec<Account>, AppError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, name, kind, opening_balance_cents, opened_on, archived
+            "SELECT id, name, kind, opening_balance_cents, opened_on, archived, currency, owner
              FROM accounts
              WHERE archived = 0
              ORDER BY name COLLATE NOCASE",
@@ -274,6 +286,8 @@ impl Db {
                 opening_balance_cents: row.get(3)?,
                 opened_on: row.get(4)?,
                 archived: row.get::<_, i64>(5)? == 1,
+                currency: row.get(6)?,
+                owner: row.get(7)?,
             })
         })?;
 
@@ -287,6 +301,8 @@ impl Db {
         kind: Option<&AccountKind>,
         opening_balance_cents: Option<i64>,
         opened_on: Option<&str>,
+        currency: Option<&str>,
+        owner: Option<&str>,
     ) -> Result<i64, AppError> {
         let account_id = self.resolve_account_ref(reference)?;
         let current = self.load_account(account_id)?;
@@ -303,19 +319,32 @@ impl Db {
                 "account opened_on date cannot be empty".to_string(),
             ));
         }
+        // `None` = 不改动（保留当前值），所以 TUI 等旧调用点不会误清空币种/归属人。
+        let next_currency = match currency {
+            Some(value) => normalize_optional_currency(Some(value))?,
+            None => current.currency.clone(),
+        };
+        let next_owner = match owner {
+            Some(value) => normalize_owner(Some(value)),
+            None => current.owner.clone(),
+        };
 
         match self.conn.execute(
             "UPDATE accounts
              SET name = ?1,
                  kind = ?2,
                  opening_balance_cents = ?3,
-                 opened_on = ?4
-             WHERE id = ?5",
+                 opened_on = ?4,
+                 currency = ?5,
+                 owner = ?6
+             WHERE id = ?7",
             params![
                 next_name,
                 next_kind.as_db_str(),
                 next_opening_balance_cents,
                 next_opened_on,
+                next_currency,
+                next_owner,
                 account_id
             ],
         ) {
@@ -3632,7 +3661,7 @@ impl Db {
     fn load_account(&self, id: i64) -> Result<Account, AppError> {
         self.conn
             .query_row(
-                "SELECT id, name, kind, opening_balance_cents, opened_on, archived
+                "SELECT id, name, kind, opening_balance_cents, opened_on, archived, currency, owner
                  FROM accounts
                  WHERE id = ?1",
                 params![id],
@@ -3645,6 +3674,8 @@ impl Db {
                         opening_balance_cents: row.get(3)?,
                         opened_on: row.get(4)?,
                         archived: row.get::<_, i64>(5)? == 1,
+                        currency: row.get(6)?,
+                        owner: row.get(7)?,
                     })
                 },
             )
@@ -3839,6 +3870,37 @@ impl Db {
         if self.schema_version()? < 9 {
             self.migrate_v8_to_v9()?;
         }
+        if self.schema_version()? < 10 {
+            self.migrate_v9_to_v10()?;
+        }
+        Ok(())
+    }
+
+    /// v10 — 多币种 + 归属人（本项目 fork 的改进）
+    ///
+    /// 两列都**可空**：`NULL` 表示"沿用 `metadata.currency` 主币种 / 无归属人"。
+    /// 因此旧库、旧调用点不需要回填，也不会改变既有语义。
+    fn migrate_v9_to_v10(&mut self) -> Result<(), AppError> {
+        let existing: Vec<String> = {
+            let mut statement = self.conn.prepare("PRAGMA table_info(accounts)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns
+        };
+        self.conn.execute_batch("BEGIN;")?;
+        if !existing.iter().any(|c| c.eq_ignore_ascii_case("currency")) {
+            self.conn
+                .execute_batch("ALTER TABLE accounts ADD COLUMN currency TEXT;")?;
+        }
+        if !existing.iter().any(|c| c.eq_ignore_ascii_case("owner")) {
+            self.conn
+                .execute_batch("ALTER TABLE accounts ADD COLUMN owner TEXT;")?;
+        }
+        self.conn.execute_batch(
+            "UPDATE metadata SET schema_version = 10 WHERE id = 1;
+             COMMIT;",
+        )?;
         Ok(())
     }
 
@@ -4447,20 +4509,77 @@ impl Db {
         Ok(())
     }
 
+    /// 区间内出现过的生效币种（账户自带优先，否则主币种）。
+    fn summary_currencies(&self, from: &str, to: &str) -> Result<Vec<String>, AppError> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT COALESCE(a.currency, (SELECT currency FROM metadata WHERE id = 1))
+             FROM transactions t
+             JOIN accounts a ON a.id = t.account_id
+             WHERE t.deleted_at IS NULL
+               AND t.txn_date >= ?1
+               AND t.txn_date <= ?2
+             ORDER BY 1",
+        )?;
+        let rows = statement.query_map(params![from, to], |row| row.get::<_, String>(0))?;
+        let mut out = rows.collect::<Result<Vec<_>, _>>()?;
+        out.retain(|code| !code.trim().is_empty());
+        Ok(out)
+    }
+
+    /// 单个账户的生效币种。
+    fn account_effective_currency(&self, account_id: i64) -> Result<Option<String>, AppError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(currency, (SELECT currency FROM metadata WHERE id = 1))
+                 FROM accounts
+                 WHERE id = ?1",
+                params![account_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     fn summary_all_accounts(&self, from: &str, to: &str) -> Result<SummaryRecord, AppError> {
-        let (transaction_count, income_cents, expense_cents, transfer_in_cents, transfer_out_cents):
-            (i64, i64, i64, i64, i64) = self.conn.query_row(
+        // 多币种护栏：金额以"分"为单位存储、币种挂在账户上，
+        // 所以跨币种相加会得到一个没有意义的数字（例如 THB 3625.86 + CNY 300）。
+        // 这里 fail closed —— 宁可报错，也不给错数。
+        let currencies = self.summary_currencies(from, to)?;
+        if currencies.len() > 1 {
+            return Err(AppError::Validation(format!(
+                "this range spans {} currencies ({}) and they must not be summed together;                  narrow it down with `--account <name>` — 在 Helius 里「一个人 × 一种币种」就是一个账户",
+                currencies.len(),
+                currencies.join(", ")
+            )));
+        }
+        let currency = currencies.first().cloned();
+
+        let mut sql = String::from(
             "SELECT
                 COUNT(*),
-                COALESCE(SUM(CASE WHEN kind = 'income' THEN amount_cents ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN kind = 'expense' THEN amount_cents ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN kind = 'transfer' THEN amount_cents ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN kind = 'transfer' THEN amount_cents ELSE 0 END), 0)
-             FROM transactions
-             WHERE deleted_at IS NULL
-               AND txn_date >= ?1
-               AND txn_date <= ?2",
-            params![from, to],
+                COALESCE(SUM(CASE WHEN t.kind = 'income' THEN t.amount_cents ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN t.kind = 'expense' THEN t.amount_cents ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN t.kind = 'transfer' THEN t.amount_cents ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN t.kind = 'transfer' THEN t.amount_cents ELSE 0 END), 0)
+             FROM transactions t
+             JOIN accounts a ON a.id = t.account_id
+             WHERE t.deleted_at IS NULL
+               AND t.txn_date >= ?1
+               AND t.txn_date <= ?2",
+        );
+        let mut values: Vec<String> = vec![from.to_string(), to.to_string()];
+        if let Some(code) = &currency {
+            sql.push_str(&format!(
+                " AND COALESCE(a.currency, (SELECT currency FROM metadata WHERE id = 1)) = ?3"
+            ));
+            values.push(code.clone());
+        }
+
+        let (transaction_count, income_cents, expense_cents, transfer_in_cents, transfer_out_cents):
+            (i64, i64, i64, i64, i64) = self.conn.query_row(
+            &sql,
+            rusqlite::params_from_iter(values.iter()),
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
 
@@ -4469,6 +4588,7 @@ impl Db {
             to: to.to_string(),
             account_id: None,
             account_name: None,
+            currency,
             transaction_count,
             income_cents,
             expense_cents,
@@ -4508,6 +4628,7 @@ impl Db {
             to: to.to_string(),
             account_id: Some(account_id),
             account_name: Some(account_name),
+            currency: self.account_effective_currency(account_id)?,
             transaction_count,
             income_cents,
             expense_cents,
@@ -4974,7 +5095,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     kind TEXT NOT NULL CHECK (kind IN ('cash', 'checking', 'savings', 'credit')),
     opening_balance_cents INTEGER NOT NULL DEFAULT 0,
     opened_on TEXT NOT NULL,
-    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1))
+    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+    currency TEXT,
+    owner TEXT
 );
 
 CREATE TABLE IF NOT EXISTS categories (
@@ -5208,6 +5331,23 @@ fn normalize_currency_code(currency: &str) -> Result<String, AppError> {
         ));
     }
     Ok(normalized)
+}
+
+/// `None`/空 → `None`（沿用主币种）；否则校验并大写。
+fn normalize_optional_currency(currency: Option<&str>) -> Result<Option<String>, AppError> {
+    match currency {
+        None => Ok(None),
+        Some(value) if value.trim().is_empty() => Ok(None),
+        Some(value) => Ok(Some(normalize_currency_code(value)?)),
+    }
+}
+
+/// `None`/空 → `None`（未指定归属人）；否则去空白保留原文（中文姓名不转大小写）。
+fn normalize_owner(owner: Option<&str>) -> Option<String> {
+    owner
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn normalize_name(entity: &str, value: &str) -> Result<String, AppError> {

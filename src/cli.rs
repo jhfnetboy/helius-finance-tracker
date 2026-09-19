@@ -98,6 +98,12 @@ pub struct AccountAddArgs {
     pub opening_balance: Option<String>,
     #[arg(long)]
     pub opened_on: Option<String>,
+    /// 账户币种，3 字母代码（CNY/USD/THB/EUR…）。省略则沿用主币种。
+    #[arg(long)]
+    pub currency: Option<String>,
+    /// 归属人（我 / 晓青 / F哥 …）。用于按人分组统计。
+    #[arg(long)]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -111,6 +117,10 @@ pub struct AccountEditArgs {
     pub opening_balance: Option<String>,
     #[arg(long)]
     pub opened_on: Option<String>,
+    #[arg(long)]
+    pub currency: Option<String>,
+    #[arg(long)]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Args)]

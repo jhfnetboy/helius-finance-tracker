@@ -24,6 +24,8 @@ fn seed_checking(db: &Db) {
             kind: AccountKind::Checking,
             opening_balance_cents: 0,
             opened_on: "2026-01-01".to_string(),
+            currency: None,
+            owner: None,
         })
         .expect("seed checking");
 }

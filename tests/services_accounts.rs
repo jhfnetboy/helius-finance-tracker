@@ -22,6 +22,8 @@ fn seed_account(service: &AccountService, name: &str, kind: AccountKind) -> i64 
             kind,
             opening_balance_cents: 0,
             opened_on: "2026-01-01".to_string(),
+            currency: None,
+            owner: None,
         })
         .expect("add_account")
 }
@@ -54,6 +56,8 @@ fn add_rejects_duplicate_name() {
             kind: AccountKind::Checking,
             opening_balance_cents: 0,
             opened_on: "2026-01-01".to_string(),
+            currency: None,
+            owner: None,
         })
         .expect_err("duplicate should fail");
     assert!(

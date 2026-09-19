@@ -902,7 +902,8 @@ fn planning_schema_migration_from_v7_to_v8_recreates_planning_tables() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 9);
+    // 迁移链会把库推到当前最新版本（fork 加了 v10 多币种/归属人）
+    assert_eq!(version, helius::CURRENT_SCHEMA_VERSION);
     assert_eq!(planning_items_exists, 1);
     assert_eq!(planning_goals_exists, 1);
 }

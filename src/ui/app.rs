@@ -2260,6 +2260,8 @@ impl App {
                 kind,
                 opening_balance_cents: parse_balance_to_cents(form_value(form, 2))?,
                 opened_on: normalize_date_input(form_value(form, 3))?,
+                currency: None,
+                owner: None,
             },
         )?;
         Ok(FormOutcome::Refresh(format!(
@@ -2276,6 +2278,8 @@ impl App {
                 kind: Some(kind),
                 opening_balance_cents: Some(parse_balance_to_cents(form_value(form, 2))?),
                 opened_on: Some(normalize_date_input(form_value(form, 3))?),
+                currency: None,
+                owner: None,
             },
         )?;
         Ok(FormOutcome::Refresh(format!("Updated account {id}.")))

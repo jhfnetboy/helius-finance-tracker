@@ -10,7 +10,7 @@ mod shell;
 mod theme;
 mod ui;
 
-pub use crate::db::Db;
+pub use crate::db::{Db, CURRENT_SCHEMA_VERSION};
 pub use crate::model::{Account, AccountKind, TransactionFilters};
 
 use std::ffi::OsString;
@@ -240,6 +240,8 @@ fn handle_account(db: Db, command: AccountCommand, stdout: &mut dyn Write) -> Re
             kind,
             opening_balance,
             opened_on,
+            currency,
+            owner,
         }) => {
             let opening_balance_cents = match opening_balance {
                 Some(value) => parse_balance_to_cents(&value)?,
@@ -254,6 +256,8 @@ fn handle_account(db: Db, command: AccountCommand, stdout: &mut dyn Write) -> Re
                 kind,
                 opening_balance_cents,
                 opened_on,
+                currency,
+                owner,
             })?;
             writeln!(
                 stdout,
@@ -268,6 +272,8 @@ fn handle_account(db: Db, command: AccountCommand, stdout: &mut dyn Write) -> Re
             kind,
             opening_balance,
             opened_on,
+            currency,
+            owner,
         }) => {
             let name = normalize_optional_string(name);
             let opened_on = normalize_optional_date(opened_on)?;
@@ -278,6 +284,8 @@ fn handle_account(db: Db, command: AccountCommand, stdout: &mut dyn Write) -> Re
                 reference: account,
                 name,
                 kind,
+                currency,
+                owner,
                 opening_balance_cents,
                 opened_on,
             })?;

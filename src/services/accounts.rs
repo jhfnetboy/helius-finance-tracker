@@ -8,6 +8,10 @@ pub struct AddAccountRequest {
     pub kind: AccountKind,
     pub opening_balance_cents: i64,
     pub opened_on: String,
+    /// 账户币种。`None` = 沿用主币种。
+    pub currency: Option<String>,
+    /// 归属人。`None` = 未指定。
+    pub owner: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -17,6 +21,10 @@ pub struct EditAccountRequest {
     pub kind: Option<AccountKind>,
     pub opening_balance_cents: Option<i64>,
     pub opened_on: Option<String>,
+    /// `None` = 不改动币种。
+    pub currency: Option<String>,
+    /// `None` = 不改动归属人。
+    pub owner: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +50,8 @@ impl<'a> AccountService<'a> {
             &req.kind,
             req.opening_balance_cents,
             &req.opened_on,
+            req.currency.as_deref(),
+            req.owner.as_deref(),
         )
     }
 
@@ -50,6 +60,8 @@ impl<'a> AccountService<'a> {
             && req.kind.is_none()
             && req.opening_balance_cents.is_none()
             && req.opened_on.is_none()
+            && req.currency.is_none()
+            && req.owner.is_none()
         {
             return Err(AppError::Validation(
                 "account edit requires at least one field change".to_string(),
@@ -61,6 +73,8 @@ impl<'a> AccountService<'a> {
             req.kind.as_ref(),
             req.opening_balance_cents,
             req.opened_on.as_deref(),
+            req.currency.as_deref(),
+            req.owner.as_deref(),
         )
     }
 

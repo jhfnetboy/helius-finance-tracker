@@ -255,6 +255,10 @@ pub struct Account {
     pub opening_balance_cents: i64,
     pub opened_on: String,
     pub archived: bool,
+    /// 账户币种（3 字母）。`None` = 沿用主币种 `metadata.currency`。
+    pub currency: Option<String>,
+    /// 归属人（我 / 晓青 / F哥 …），用于按人分组。`None` = 未指定。
+    pub owner: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -300,6 +304,9 @@ pub struct SummaryRecord {
     pub to: String,
     pub account_id: Option<i64>,
     pub account_name: Option<String>,
+    /// 本次汇总覆盖的币种。`None` = 区间内无交易（没有币种可言）。
+    /// **永远不会出现"多种币种被合并"的情况** —— 那种情况直接报错。
+    pub currency: Option<String>,
     pub transaction_count: i64,
     pub income_cents: i64,
     pub expense_cents: i64,

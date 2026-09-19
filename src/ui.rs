@@ -113,6 +113,7 @@ pub(super) fn shift_index(index: &mut usize, len: usize, delta: isize) {
 
 pub(super) fn empty_summary() -> SummaryRecord {
     SummaryRecord {
+        currency: None,
         from: today_iso(),
         to: today_iso(),
         account_id: None,

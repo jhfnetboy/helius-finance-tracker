@@ -37,13 +37,17 @@ pub fn write_accounts(
     }
 
     let mut table = new_table();
-    table.set_header(header_row(["ID", "Name", "Type", "Opening", "Opened"]));
+    table.set_header(header_row([
+        "ID", "Name", "Type", "Opening", "Currency", "Owner", "Opened",
+    ]));
     for account in accounts {
         table.add_row([
             Cell::new(account.id),
             Cell::new(&account.name),
             Cell::new(account.kind.as_db_str()),
             Cell::new(format_cents(account.opening_balance_cents)),
+            Cell::new(account.currency.as_deref().unwrap_or("-")),
+            Cell::new(account.owner.as_deref().unwrap_or("-")),
             Cell::new(&account.opened_on),
         ]);
     }
@@ -146,6 +150,10 @@ pub fn write_summary(
     table.add_row([
         Cell::new(label_text("Account")),
         Cell::new(summary.account_name.as_deref().unwrap_or("all accounts")),
+    ]);
+    table.add_row([
+        Cell::new(label_text("Currency")),
+        Cell::new(summary.currency.as_deref().unwrap_or("-")),
     ]);
     table.add_row([
         Cell::new(label_text("Transactions")),
