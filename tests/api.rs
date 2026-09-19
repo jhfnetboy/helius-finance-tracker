@@ -5,7 +5,7 @@
 
 use helius::api::{self, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_VALIDATION};
 use helius::services::accounts::{AccountService, AddAccountRequest};
-use helius::{AccountKind, CategoryKind, Db};
+use helius::{AccountKind, CategoryKind, Db, TransactionFilters};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -231,4 +231,154 @@ fn failures_are_classified_with_codes_and_exit_codes() {
         "amount":1,"account":"我-CNY","category":"Claude"}}"#;
     call(&db, dup);
     let _ = (EXIT_CONFLICT, dup);
+}
+
+// ── A3 批量原子 ───────────────────────────────────────────────────────────
+
+fn batch_request(items: &str, extra: &str) -> String {
+    format!(r#"{{"method":"tx.batch"{extra},"params":{{"items":[{items}]}}}}"#)
+}
+
+const ITEM_A: &str = r#"{"date":"2026-09-19","kind":"expense","amount":300,
+    "account":"我-CNY","category":"Claude","idempotency_key":"ds-1"}"#;
+const ITEM_B: &str = r#"{"date":"2026-09-14","kind":"expense","amount":50,
+    "account":"我-CNY","category":"Claude","idempotency_key":"ds-2"}"#;
+const ITEM_BAD: &str = r#"{"date":"2026-09-20","kind":"expense","amount":33,
+    "account":"账户不存在","category":"Claude","idempotency_key":"ds-bad"}"#;
+
+fn count_txns(db: &Db) -> usize {
+    let filters = TransactionFilters {
+        from: None,
+        to: None,
+        account: None,
+        category: None,
+        search: None,
+        limit: None,
+        include_deleted: false,
+    };
+    db.list_transactions(&filters).expect("list").len()
+}
+
+#[test]
+fn batch_inserts_every_item_in_one_call() {
+    let (_guard, db) = fresh_db();
+    seed(&db);
+    category(&db, "Claude");
+
+    let (body, code) = call(&db, &batch_request(&format!("{ITEM_A},{ITEM_B}"), ""));
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(body["data"]["inserted"], 2);
+    assert_eq!(body["data"]["deduped"], 0);
+    assert_eq!(body["data"]["committed"], Value::Bool(true));
+    assert_eq!(count_txns(&db), 2);
+}
+
+#[test]
+fn resending_a_batch_dedupes_instead_of_double_booking() {
+    let (_guard, db) = fresh_db();
+    seed(&db);
+    category(&db, "Claude");
+
+    let request = batch_request(&format!("{ITEM_A},{ITEM_B}"), "");
+    call(&db, &request);
+    let (body, code) = call(&db, &request);
+
+    assert_eq!(code, EXIT_OK, "重发不是错误");
+    assert_eq!(body["data"]["inserted"], 0);
+    assert_eq!(body["data"]["deduped"], 2);
+    assert_eq!(count_txns(&db), 2, "重发同一张截图不能翻倍");
+}
+
+#[test]
+fn one_invalid_item_rolls_back_the_whole_batch() {
+    let (_guard, db) = fresh_db();
+    seed(&db);
+    category(&db, "Claude");
+
+    let (body, code) = call(
+        &db,
+        &batch_request(&format!("{ITEM_A},{ITEM_B},{ITEM_BAD}"), ""),
+    );
+
+    assert_eq!(code, EXIT_NOT_FOUND);
+    assert_eq!(body["ok"], Value::Bool(false));
+    assert_eq!(body["error"]["code"], "NOT_FOUND");
+    // 必须指出是哪一行
+    assert_eq!(body["error"]["details"][0]["index"], 2);
+    // 要么全进要么全不进
+    assert_eq!(count_txns(&db), 0, "整批回滚，前两行也不能留下");
+    assert!(db.find_transaction_by_external_ref("ds-1").expect("lookup").is_none());
+}
+
+#[test]
+fn batch_dry_run_reports_the_plan_without_writing() {
+    let (_guard, db) = fresh_db();
+    seed(&db);
+    category(&db, "Claude");
+
+    let (body, code) = call(
+        &db,
+        &batch_request(&format!("{ITEM_A},{ITEM_B}"), r#","dry_run":true"#),
+    );
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(body["data"]["would_insert"], 2);
+    assert!(body["data"]["results"]
+        .as_array()
+        .expect("plan")
+        .iter()
+        .all(|entry| entry["status"] == "would_insert"));
+    assert_eq!(count_txns(&db), 0, "dry-run 绝不能落库");
+}
+
+// ── A6 待确认挂号 ─────────────────────────────────────────────────────────
+
+#[test]
+fn questions_can_be_parked_instead_of_guessed() {
+    let (_guard, db) = fresh_db();
+    seed(&db);
+
+    let (asked, code) = call(
+        &db,
+        r#"{"method":"questions.ask","params":{
+            "question":"C-0014 那笔的泰铢原额是多少？","scope":"friends",
+            "impact":"补齐后晓青线泰铢总额才完整","session":"jizhang-session"}}"#,
+    );
+    assert_eq!(code, EXIT_OK);
+    let id = asked["data"]["id"].as_i64().expect("id");
+    assert_eq!(asked["data"]["status"], "open");
+
+    let (listed, _) = call(&db, r#"{"method":"questions.list"}"#);
+    assert_eq!(listed["data"].as_array().expect("list").len(), 1);
+    assert_eq!(listed["data"][0]["asked_by"], "agent", "默认记为 agent 挂号");
+
+    let (answered, code) = call(
+        &db,
+        &format!(
+            r#"{{"method":"questions.answer","params":{{"id":{id},"answer":"THB 3652.18"}}}}"#
+        ),
+    );
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(answered["data"]["status"], "closed");
+
+    // 默认只列 open
+    let (open, _) = call(&db, r#"{"method":"questions.list"}"#);
+    assert!(open["data"].as_array().expect("open").is_empty());
+
+    // 全量里能看到答案
+    let (all, _) = call(&db, r#"{"method":"questions.list","params":{"open_only":false}}"#);
+    assert_eq!(all["data"][0]["answer"], "THB 3652.18");
+    assert_eq!(all["data"][0]["status"], "closed");
+}
+
+#[test]
+fn answering_an_unknown_question_is_not_found() {
+    let (_guard, db) = fresh_db();
+    seed(&db);
+
+    let (body, code) = call(
+        &db,
+        r#"{"method":"questions.answer","params":{"id":424242,"answer":"x"}}"#,
+    );
+    assert_eq!(code, EXIT_NOT_FOUND);
+    assert_eq!(body["error"]["code"], "NOT_FOUND");
 }

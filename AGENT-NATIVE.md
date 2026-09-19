@@ -118,10 +118,35 @@
 |:---|:---|:---|
 | **N1** | schema v11：`txn` 溯源列（`source`/`evidence`/`session`/`external_ref`/`confidence`）+ 唯一索引 | ✅ |
 | **N2** | `helius api`：信封 + 错误码 + 退出码 + 方法分发；`schema.describe`、`accounts.list`、`tx.list`、`summary`、`tx.add`（幂等 + dry_run + 溯源） | ✅ |
-| **N3** | `tx.batch`（A3 批量原子）与 `questions.*`（A6 挂号） | ⬜ |
+| **N3** | `tx.batch`（A3 批量原子）与 `questions.*`（A6 挂号） | ✅ |
 | **N4** | `helius mcp`（MCP stdio server，薄适配层） | ⬜ |
 | **N5** | `helius serve` 网页界面 + dry-run 确认入口 | ⬜ |
 | **N6** | 迁移 `cost/` 现有数据（用幂等键，天然可重跑） | ⬜ |
+
+### A3 批量原子的语义
+
+```json
+{"method":"tx.batch","params":{"items":[ {…}, {…}, {…} ]}}
+```
+
+- **先全部解析引用**（此时不写库）→ 全部通过才开事务逐笔插入
+- 任何一笔失败 → **ROLLBACK 整批**，并在 `error.details[index]` 指出是**哪一行**
+- 已存在幂等键的行计为 `deduped`，不算失败
+- 响应：`{total, inserted, deduped, failed, committed, results[]}`
+
+```
+① 3 行一次提交   → inserted:3, committed:true
+② 重发同一批     → deduped:3, inserted:0，库内仍是 3 笔
+③ 第 3 行账户写错 → NOT_FOUND + details[{index:2}]，**前两行也被回滚**（good-1 未落库）
+```
+
+### A6 待确认（挂号处）
+
+| 方法 | 参数 | 说明 |
+|:---|:---|:---|
+| `questions.ask` | `question`（必填）、`scope`、`impact`、`session` | 归属判不准时挂号，**不猜**；返回 `{id, status:"open"}` |
+| `questions.list` | `open_only`（默认 true） | 列出待确认 |
+| `questions.answer` | `id`、`answer` | 回答并关闭 |
 
 ### 已可用（N2）实测
 

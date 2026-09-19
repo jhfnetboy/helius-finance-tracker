@@ -86,7 +86,7 @@ ALTER TABLE accounts ADD COLUMN owner    TEXT;   -- 我 / 晓青 / F哥
 
 完整设计见 [`AGENT-NATIVE.md`](AGENT-NATIVE.md)。要点：**这个工具的第一公民是 agent。**
 
-上游的 `--json` 只是给人看的格式，缺的是**契约**。已实现七条中的 A1/A2/A4/A5/A7：
+上游的 `--json` 只是给人看的格式，缺的是**契约**。**七条契约已全部实现（A1–A7）**：
 
 | 契约 | 实现 |
 |:---|:---|
@@ -94,16 +94,28 @@ ALTER TABLE accounts ADD COLUMN owner    TEXT;   -- 我 / 晓青 / F哥
 | A2 幂等 | `idempotency_key` → `transactions.external_ref` UNIQUE；重发返回 `deduped:true`，**不重复记账** |
 | A4 dry-run | `"dry_run":true` 返回 `would_write`，**不落库**（实测流水数仍为 0） |
 | A5 溯源 | 每笔记 `source`/`evidence`/`session`/`confidence`，财务数据可回溯到"哪次对话、哪张截图" |
+| A3 批量原子 | `tx.batch`：一张截图 N 行一次提交；先全量解析引用，任一失败则**整批 ROLLBACK**，并用 `error.details[index]` 指出是哪一行 |
+| A6 挂号 | `questions.ask/list/answer`：归属判不准时**挂号而非猜**，答案关单后留痕 |
 | A7 自省 | `schema.describe` 一次返回账户/分类/币种/合法枚举/错误码/退出码，agent 不用猜 |
 | — 错误码 | `VALIDATION`/`NOT_FOUND`/`DUPLICATE`/`CURRENCY_MISMATCH`/… + 退出码 0/2/3/4/5 |
 
-**测试：130 passed / 0 failed**（其中 `tests/api.rs` 7 个用例专门固定这套契约）。
+实测（真实数据形态）：
+
+```
+tx.batch 3 行         → inserted:3, committed:true
+重发同一批            → deduped:3, inserted:0，库内仍是 3 笔
+第 3 行账户写错        → NOT_FOUND + details[{index:2}]，前两行也被回滚（未落库）
+dry_run               → would_insert:2，库内 0 笔
+questions.ask → list → answer → 关闭后不再出现在 open 列表
+```
+
+**测试：136 passed / 0 failed**（`tests/api.rs` 13 个用例专门固定这套契约）。
 
 ## 待办路线图
 
 | 优先级 | 事项 | 说明 |
 |:---|:---|:---|
-| **N3** | `tx.batch` + `questions.*` | 批量原子（一张截图 9 行）+ 归属判不准时挂号而非猜 |
+| ~~N3~~ ✅ | ~~`tx.batch` + `questions.*`~~ | 已完成：批量原子 + 挂号 |
 | **N4** | `helius mcp` | MCP stdio server，让支持的 agent 原生 tool 调用（薄适配层，复用 api 方法层） |
 | **P1** | 报表按人分组 | `owner` 列已在库里，还差按 owner 聚合 —— 「晓青这条线垫了多少、收回多少」 |
 | **N5** | `helius serve` 网页界面 | 人类看板 + dry-run 计划的确认入口。做进 Rust 二进制（单程序），只听 127.0.0.1 |

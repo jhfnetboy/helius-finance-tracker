@@ -63,6 +63,25 @@ fn classify(error: &AppError) -> (&'static str, &'static str, i32) {
     }
 }
 
+/// 方法层内部的失败类型：既能承载普通 `AppError`，
+/// 也能承载带 `details` 的富错误（批量操作要指出是哪一行出的问题）。
+enum ApiFailure {
+    Plain(AppError),
+    Detailed {
+        code: &'static str,
+        message: String,
+        hint: &'static str,
+        exit: i32,
+        details: Value,
+    },
+}
+
+impl From<AppError> for ApiFailure {
+    fn from(error: AppError) -> Self {
+        ApiFailure::Plain(error)
+    }
+}
+
 fn ok(method: &str, data: Value, meta: Value) -> (String, i32) {
     (
         json!({ "ok": true, "method": method, "data": data, "meta": meta }).to_string(),
@@ -76,6 +95,26 @@ fn err(method: &str, code: &str, message: String, hint: &str, exit: i32) -> (Str
             "ok": false,
             "method": method,
             "error": { "code": code, "message": message, "hint": hint }
+        })
+        .to_string(),
+        exit,
+    )
+}
+
+/// 带 `details` 的错误信封：批量操作失败时用来指出**具体是哪一行**。
+fn err_with_details(
+    method: &str,
+    code: &str,
+    message: String,
+    hint: &str,
+    exit: i32,
+    details: Value,
+) -> (String, i32) {
+    (
+        json!({
+            "ok": false,
+            "method": method,
+            "error": { "code": code, "message": message, "hint": hint, "details": details }
         })
         .to_string(),
         exit,
@@ -122,6 +161,43 @@ fn opt_str(params: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 从参数里构造一笔流水 + 它的溯源信息。
+/// `tx.add` 与 `tx.batch` 共用同一套解析 —— 保证两条路径语义完全一致。
+fn build_transaction(
+    params: &Value,
+    idempotency_key: Option<String>,
+    method: &str,
+) -> Result<(NewTransaction, TransactionProvenance), AppError> {
+    let required = |key: &str| {
+        str_param(params, key).ok_or_else(|| {
+            AppError::Validation(format!("{method} requires `{key}`"))
+        })
+    };
+    let txn = NewTransaction {
+        txn_date: crate::normalize_date(&required("date")?)?,
+        kind: parse_kind(&required("kind")?)?,
+        amount_cents: crate::amount::parse_amount_to_cents(&amount_to_text(
+            params
+                .get("amount")
+                .ok_or_else(|| AppError::Validation(format!("{method} requires `amount`")))?,
+        )?)?,
+        account: required("account")?,
+        to_account: opt_str(params, "to_account"),
+        category: opt_str(params, "category"),
+        payee: opt_str(params, "payee"),
+        note: opt_str(params, "note"),
+        recurring_rule_id: None,
+    };
+    let provenance = TransactionProvenance {
+        external_ref: idempotency_key,
+        source: opt_str(params, "source").or_else(|| Some("agent".to_string())),
+        evidence: opt_str(params, "evidence"),
+        session: opt_str(params, "session"),
+        confidence: opt_str(params, "confidence"),
+    };
+    Ok((txn, provenance))
+}
+
 /// 处理一次调用。返回 (JSON 字符串, 退出码)。
 pub fn handle(db: &Db, raw: &str) -> (String, i32) {
     let request: ApiRequest = match serde_json::from_str(raw) {
@@ -139,14 +215,21 @@ pub fn handle(db: &Db, raw: &str) -> (String, i32) {
     let method = request.method.clone();
     match dispatch(db, &request) {
         Ok((data, meta)) => ok(&method, data, meta),
-        Err(error) => {
+        Err(ApiFailure::Plain(error)) => {
             let (code, hint, exit) = classify(&error);
             err(&method, code, error.to_string(), hint, exit)
         }
+        Err(ApiFailure::Detailed {
+            code,
+            message,
+            hint,
+            exit,
+            details,
+        }) => err_with_details(&method, code, message, hint, exit, details),
     }
 }
 
-fn dispatch(db: &Db, request: &ApiRequest) -> Result<(Value, Value), AppError> {
+fn dispatch(db: &Db, request: &ApiRequest) -> Result<(Value, Value), ApiFailure> {
     let meta = json!({
         "schema_version": crate::CURRENT_SCHEMA_VERSION,
         "primary_currency": db.currency_code()?,
@@ -181,6 +264,11 @@ fn dispatch(db: &Db, request: &ApiRequest) -> Result<(Value, Value), AppError> {
                         "CURRENCY_MISMATCH", "DUPLICATE", "NOT_FOUND", "CONFLICT",
                         "CONFIG", "INTERNAL"
                     ],
+                    "methods": [
+                        "schema.describe", "accounts.list", "tx.list", "summary",
+                        "tx.add", "tx.batch",
+                        "questions.ask", "questions.list", "questions.answer"
+                    ],
                     "exit_codes": {
                         "0": "ok", "2": "validation", "3": "not_found",
                         "4": "conflict", "5": "internal"
@@ -214,11 +302,11 @@ fn dispatch(db: &Db, request: &ApiRequest) -> Result<(Value, Value), AppError> {
             let p = &request.params;
             let from = match str_param(p, "from") {
                 Some(value) => crate::normalize_date(&value)?,
-                None => return Err(AppError::Validation("summary requires `from`".to_string())),
+                None => return Err(AppError::Validation("summary requires `from`".to_string()).into()),
             };
             let to = match str_param(p, "to") {
                 Some(value) => crate::normalize_date(&value)?,
-                None => return Err(AppError::Validation("summary requires `to`".to_string())),
+                None => return Err(AppError::Validation("summary requires `to`".to_string()).into()),
             };
             let record = db.summary(&from, &to, opt_str(p, "account").as_deref())?;
             Ok((json!(record), meta))
@@ -227,35 +315,8 @@ fn dispatch(db: &Db, request: &ApiRequest) -> Result<(Value, Value), AppError> {
         // ── 写入：幂等 + dry-run + 溯源 ───────────────────────────────
         "tx.add" => {
             let p = &request.params;
-            let txn = NewTransaction {
-                txn_date: crate::normalize_date(&str_param(p, "date").ok_or_else(|| {
-                    AppError::Validation("tx.add requires `date`".to_string())
-                })?)?,
-                kind: parse_kind(&str_param(p, "kind").ok_or_else(|| {
-                    AppError::Validation("tx.add requires `kind`".to_string())
-                })?)?,
-                amount_cents: crate::amount::parse_amount_to_cents(&amount_to_text(
-                    p.get("amount").ok_or_else(|| {
-                        AppError::Validation("tx.add requires `amount`".to_string())
-                    })?,
-                )?)?,
-                account: str_param(p, "account").ok_or_else(|| {
-                    AppError::Validation("tx.add requires `account`".to_string())
-                })?,
-                to_account: opt_str(p, "to_account"),
-                category: opt_str(p, "category"),
-                payee: opt_str(p, "payee"),
-                note: opt_str(p, "note"),
-                recurring_rule_id: None,
-            };
-
-            let provenance = TransactionProvenance {
-                external_ref: request.idempotency_key.clone(),
-                source: opt_str(p, "source").or_else(|| Some("agent".to_string())),
-                evidence: opt_str(p, "evidence"),
-                session: opt_str(p, "session"),
-                confidence: opt_str(p, "confidence"),
-            };
+            let (txn, provenance) =
+                build_transaction(p, request.idempotency_key.clone(), "tx.add")?;
 
             // 幂等：同 key 已存在 → 直接返回原记录，不报错（重发是正常行为）
             if let Some(key) = &provenance.external_ref {
@@ -306,8 +367,192 @@ fn dispatch(db: &Db, request: &ApiRequest) -> Result<(Value, Value), AppError> {
             ))
         }
 
+        // ── A3 批量原子：一张截图 = 一次提交，要么全进要么全不进 ────────
+        "tx.batch" => {
+            let p = &request.params;
+            let items = p
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AppError::Validation("tx.batch requires an `items` array".to_string()))?;
+            if items.is_empty() {
+                return Err(AppError::Validation("`items` must not be empty".to_string()).into());
+            }
+
+            // ① 形状解析：任何一行不合法 → 整体拒绝，一行都不写
+            let mut shape_errors: Vec<Value> = Vec::new();
+            let mut built: Vec<(NewTransaction, TransactionProvenance)> = Vec::new();
+            for (index, item) in items.iter().enumerate() {
+                let key = opt_str(item, "idempotency_key");
+                match build_transaction(item, key, "tx.batch item") {
+                    Ok(pair) => built.push(pair),
+                    Err(error) => shape_errors.push(json!({
+                        "index": index,
+                        "error": { "code": classify(&error).0, "message": error.to_string() }
+                    })),
+                }
+            }
+            if !shape_errors.is_empty() {
+                let (code, hint, exit) = classify(&AppError::Validation(String::new()));
+                return Err(ApiFailure::Detailed {
+                    code,
+                    message: format!(
+                        "{} of {} items failed validation; **nothing was written**",
+                        shape_errors.len(),
+                        items.len()
+                    ),
+                    hint,
+                    exit,
+                    details: Value::Array(shape_errors),
+                });
+            }
+
+            // ② 幂等：已记过的行直接算 deduped，不进写入集
+            let mut results: Vec<Value> = Vec::new();
+            let mut pending: Vec<(usize, NewTransaction, TransactionProvenance)> = Vec::new();
+            let mut deduped = 0usize;
+            for (index, (txn, provenance)) in built.into_iter().enumerate() {
+                match provenance.external_ref.as_deref() {
+                    Some(key) => match db.find_transaction_by_external_ref(key)? {
+                        Some(existing) => {
+                            deduped += 1;
+                            results.push(json!({
+                                "index": index, "status": "deduped", "id": existing,
+                                "idempotency_key": key
+                            }));
+                        }
+                        None => pending.push((index, txn, provenance)),
+                    },
+                    None => pending.push((index, txn, provenance)),
+                }
+            }
+
+            // ③ dry-run：只回报将要写入什么
+            if request.dry_run {
+                let mut plan: Vec<Value> = results.clone();
+                for (index, txn, _) in &pending {
+                    plan.push(json!({
+                        "index": index,
+                        "status": "would_insert",
+                        "txn_date": txn.txn_date,
+                        "kind": format!("{:?}", txn.kind).to_ascii_lowercase(),
+                        "amount_cents": txn.amount_cents,
+                        "account": txn.account,
+                        "category": txn.category,
+                    }));
+                }
+                plan.sort_by_key(|entry| entry["index"].as_u64().unwrap_or(0));
+                return Ok((
+                    json!({
+                        "dry_run": true,
+                        "total": items.len(),
+                        "would_insert": pending.len(),
+                        "deduped": deduped,
+                        "results": plan,
+                    }),
+                    meta,
+                ));
+            }
+
+            // ④ 原子写入
+            if pending.is_empty() {
+                return Ok((
+                    json!({
+                        "total": items.len(), "inserted": 0, "deduped": deduped,
+                        "failed": 0, "committed": true, "results": results,
+                    }),
+                    meta,
+                ));
+            }
+            let batch: Vec<(NewTransaction, TransactionProvenance)> = pending
+                .iter()
+                .map(|(_, txn, provenance)| (txn.clone(), provenance.clone()))
+                .collect();
+
+            match db.add_transactions_atomic(&batch) {
+                Ok(ids) => {
+                    for ((index, _, _), id) in pending.iter().zip(ids.iter()) {
+                        results.push(json!({ "index": index, "status": "inserted", "id": id }));
+                    }
+                    results.sort_by_key(|entry| entry["index"].as_u64().unwrap_or(0));
+                    Ok((
+                        json!({
+                            "total": items.len(),
+                            "inserted": ids.len(),
+                            "deduped": deduped,
+                            "failed": 0,
+                            "committed": true,
+                            "results": results,
+                        }),
+                        meta,
+                    ))
+                }
+                Err((failed_index, error)) => {
+                    // 回滚已发生；把库内下标换回请求里的下标再回报
+                    let request_index = pending
+                        .get(failed_index)
+                        .map(|(index, _, _)| *index)
+                        .unwrap_or(failed_index);
+                    let (code, hint, exit) = classify(&error);
+                    Err(ApiFailure::Detailed {
+                        code,
+                        message: format!(
+                            "batch aborted at item {request_index}: {error}; **nothing was written**"
+                        ),
+                        hint,
+                        exit,
+                        details: json!([{
+                            "index": request_index,
+                            "error": { "message": error.to_string() }
+                        }]),
+                    })
+                }
+            }
+        }
+
+        // ── A6 待确认是一等公民：判不准就挂号，绝不猜 ──────────────────
+        "questions.ask" => {
+            let p = &request.params;
+            let question = str_param(p, "question")
+                .ok_or_else(|| AppError::Validation("questions.ask requires `question`".to_string()))?;
+            let id = db.ask_question(
+                opt_str(p, "scope").as_deref(),
+                &question,
+                opt_str(p, "impact").as_deref(),
+                opt_str(p, "asked_by").as_deref().or(Some("agent")),
+                opt_str(p, "session").as_deref(),
+            )?;
+            Ok((json!({ "id": id, "status": "open", "question": question }), meta))
+        }
+
+        "questions.list" => {
+            let open_only = request
+                .params
+                .get("open_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            Ok((json!(db.list_questions(open_only)?), meta))
+        }
+
+        "questions.answer" => {
+            let p = &request.params;
+            let id = p
+                .get("id")
+                .and_then(|v| match v {
+                    Value::Number(n) => n.as_i64(),
+                    Value::String(s) => s.trim().parse::<i64>().ok(),
+                    _ => None,
+                })
+                .ok_or_else(|| AppError::Validation("questions.answer requires numeric `id`".to_string()))?;
+            let answer = str_param(p, "answer")
+                .ok_or_else(|| AppError::Validation("questions.answer requires `answer`".to_string()))?;
+            db.answer_question(id, &answer)?;
+            Ok((json!({ "id": id, "status": "closed", "answer": answer }), meta))
+        }
+
         other => Err(AppError::Validation(format!(
-            "unknown method `{other}`；可用：schema.describe / accounts.list / tx.list / summary / tx.add"
-        ))),
+            "unknown method `{other}`；可用：schema.describe / accounts.list / tx.list / summary / \
+             tx.add / tx.batch / questions.ask / questions.list / questions.answer"
+        ))
+        .into()),
     }
 }

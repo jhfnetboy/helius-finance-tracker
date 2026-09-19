@@ -21,7 +21,22 @@ use crate::model::{
     UpdatePlanningScenario, UpdateRecurringRule, UpdateTransaction, Weekday, WeeklyBalancePoint,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+
+/// 一条待确认挂号（agent-native 契约 A6）。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct QuestionRecord {
+    pub id: i64,
+    pub scope: Option<String>,
+    pub question: String,
+    pub impact: Option<String>,
+    pub status: String,
+    pub answer: Option<String>,
+    pub asked_by: Option<String>,
+    pub session: Option<String>,
+    pub asked_at: String,
+    pub closed_at: Option<String>,
+}
 
 /// 一笔流水的溯源信息（agent-native 契约 A5）。
 /// 字段全可空 —— 人手工记的账不必填。
@@ -488,6 +503,121 @@ impl Db {
     pub fn add_transaction(&self, transaction: &NewTransaction) -> Result<i64, AppError> {
         let resolved = self.resolve_transaction_input(transaction)?;
         self.insert_transaction(&resolved)
+    }
+
+    /// 原子批量写入（agent-native 契约 A3）。
+    ///
+    /// 语义：**要么全进，要么全不进**。
+    /// 先全部解析引用（此时不写库），全部通过才开事务逐笔插入；
+    /// 任何一笔失败 → ROLLBACK，并返回出错的下标，让 agent 知道是哪一行。
+    pub fn add_transactions_atomic(
+        &self,
+        batch: &[(NewTransaction, TransactionProvenance)],
+    ) -> Result<Vec<i64>, (usize, AppError)> {
+        let mut resolved = Vec::with_capacity(batch.len());
+        for (index, (transaction, _)) in batch.iter().enumerate() {
+            match self.resolve_transaction_input(transaction) {
+                Ok(item) => resolved.push(item),
+                Err(error) => return Err((index, error)),
+            }
+        }
+
+        if let Err(error) = self.conn.execute_batch("BEGIN IMMEDIATE;") {
+            return Err((0, error.into()));
+        }
+
+        let mut ids = Vec::with_capacity(resolved.len());
+        for (index, (item, (_, provenance))) in resolved.iter().zip(batch.iter()).enumerate() {
+            let outcome = self
+                .insert_transaction(item)
+                .and_then(|id| self.set_transaction_provenance(id, provenance).map(|_| id));
+            match outcome {
+                Ok(id) => ids.push(id),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    return Err((index, error));
+                }
+            }
+        }
+
+        if let Err(error) = self.conn.execute_batch("COMMIT;") {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+            return Err((0, error.into()));
+        }
+        Ok(ids)
+    }
+
+    // ── 待确认挂号（A6）────────────────────────────────────────────────
+
+    /// 挂一条待确认，返回它的 id。
+    pub fn ask_question(
+        &self,
+        scope: Option<&str>,
+        question: &str,
+        impact: Option<&str>,
+        asked_by: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<i64, AppError> {
+        if question.trim().is_empty() {
+            return Err(AppError::FieldValidation {
+                field: "question".to_string(),
+                reason: "must not be empty".to_string(),
+            });
+        }
+        self.conn.execute(
+            "INSERT INTO questions (scope, question, impact, status, asked_by, session, asked_at)
+             VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6)",
+            params![scope, question.trim(), impact, asked_by, session, now_timestamp()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// 列出待确认；`open_only` 为 false 时连已关闭的一起给。
+    pub fn list_questions(&self, open_only: bool) -> Result<Vec<QuestionRecord>, AppError> {
+        let sql = if open_only {
+            "SELECT id, scope, question, impact, status, answer, asked_by, session, asked_at, closed_at
+             FROM questions WHERE status = 'open' ORDER BY id"
+        } else {
+            "SELECT id, scope, question, impact, status, answer, asked_by, session, asked_at, closed_at
+             FROM questions ORDER BY status, id"
+        };
+        let mut statement = self.conn.prepare(sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok(QuestionRecord {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                question: row.get(2)?,
+                impact: row.get(3)?,
+                status: row.get(4)?,
+                answer: row.get(5)?,
+                asked_by: row.get(6)?,
+                session: row.get(7)?,
+                asked_at: row.get(8)?,
+                closed_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 回答并关闭一条待确认。
+    pub fn answer_question(&self, id: i64, answer: &str) -> Result<(), AppError> {
+        if answer.trim().is_empty() {
+            return Err(AppError::FieldValidation {
+                field: "answer".to_string(),
+                reason: "must not be empty".to_string(),
+            });
+        }
+        let changed = self.conn.execute(
+            "UPDATE questions SET status = 'closed', answer = ?2, closed_at = ?3
+             WHERE id = ?1 AND status = 'open'",
+            params![id, answer.trim(), now_timestamp()],
+        )?;
+        if changed == 0 {
+            return Err(AppError::NotFound(format!(
+                "open question `{id}` was not found"
+            )));
+        }
+        Ok(())
     }
 
     pub fn edit_transaction(&self, patch: &UpdateTransaction) -> Result<(), AppError> {
@@ -3892,6 +4022,34 @@ impl Db {
         if self.schema_version()? < 11 {
             self.migrate_v10_to_v11()?;
         }
+        if self.schema_version()? < 12 {
+            self.migrate_v11_to_v12()?;
+        }
+        Ok(())
+    }
+
+    /// v12 — 待确认挂号表（agent-native 契约 A6）
+    ///
+    /// 归属判不准时，agent 应该**挂号**而不是猜。这张表就是挂号处。
+    fn migrate_v11_to_v12(&mut self) -> Result<(), AppError> {
+        self.conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS questions (
+                 id INTEGER PRIMARY KEY,
+                 scope TEXT,
+                 question TEXT NOT NULL,
+                 impact TEXT,
+                 status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+                 answer TEXT,
+                 asked_by TEXT,
+                 session TEXT,
+                 asked_at TEXT NOT NULL,
+                 closed_at TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status);
+             UPDATE metadata SET schema_version = 12 WHERE id = 1;
+             COMMIT;",
+        )?;
         Ok(())
     }
 
@@ -4290,6 +4448,7 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_transactions_recurring_rule ON transactions(recurring_rule_id);
              CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_external_ref
                  ON transactions(external_ref) WHERE external_ref IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status);
              CREATE INDEX IF NOT EXISTS idx_reconciliations_account_date ON reconciliations(account_id, statement_ending_on);
              CREATE INDEX IF NOT EXISTS idx_recurring_rules_next_due ON recurring_rules(next_due_on);
              CREATE INDEX IF NOT EXISTS idx_recurring_occurrences_due_status ON recurring_occurrences(due_on, status);
@@ -5289,6 +5448,19 @@ CREATE TABLE IF NOT EXISTS transactions (
         OR
         (kind = 'transfer' AND to_account_id IS NOT NULL AND category_id IS NULL AND to_account_id != account_id)
     )
+);
+
+CREATE TABLE IF NOT EXISTS questions (
+    id INTEGER PRIMARY KEY,
+    scope TEXT,
+    question TEXT NOT NULL,
+    impact TEXT,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+    answer TEXT,
+    asked_by TEXT,
+    session TEXT,
+    asked_at TEXT NOT NULL,
+    closed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS recurring_occurrences (
