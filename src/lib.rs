@@ -1,5 +1,6 @@
 pub mod api;
 mod amount;
+mod serve;
 mod cli;
 mod db;
 pub mod error;
@@ -165,6 +166,7 @@ fn run_command(db_path: &Path, command: Command, stdout: &mut dyn Write) -> Resu
         Command::Shell => shell::run_interactive_shell(db_path.to_path_buf(), stdout),
         Command::Init(args) => handle_init(db_path, args, stdout),
         Command::Api(args) => with_existing_db(db_path, |db| handle_api(db, args, stdout)),
+        Command::Serve(args) => serve::run(db_path, args.port),
         Command::Account { command } => {
             with_existing_db(db_path, |db| handle_account(db, command, stdout))
         }

@@ -21,6 +21,8 @@ pub enum Command {
     Shell,
     /// Agent-native JSON 入口：读一个请求信封，写一个响应信封
     Api(ApiArgs),
+    /// 本地只读看板（人类入口）；只监听 127.0.0.1
+    Serve(ServeArgs),
     Init(InitArgs),
     Account {
         #[command(subcommand)]
@@ -89,6 +91,13 @@ pub enum AccountCommand {
     Edit(AccountEditArgs),
     Delete(AccountDeleteArgs),
     List(AccountListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// 监听端口（默认 8787，只绑 127.0.0.1）
+    #[arg(long, default_value_t = 8787)]
+    pub port: u16,
 }
 
 #[derive(Debug, Args)]

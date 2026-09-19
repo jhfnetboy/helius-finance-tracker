@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>记账看板</title>
+<style>
+  :root{
+    color-scheme: dark;
+    --bg:#0f1115; --panel:#16191f; --panel2:#1c2027; --line:#282d36;
+    --ink:#e8eaee; --muted:#8b93a1; --brand:#6f86ff;
+    --in:#3fb950; --out:#e5674f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}
+  header{padding:22px 26px 0}
+  h1{margin:0;font-size:22px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:12px;margin-top:5px}
+  nav{display:flex;gap:6px;padding:16px 26px 0}
+  nav button{background:transparent;color:var(--muted);border:1px solid transparent;
+    padding:6px 13px;border-radius:9px;font:inherit;cursor:pointer}
+  nav button:hover{background:var(--panel)}
+  nav button.on{background:var(--panel);color:var(--ink);border-color:var(--line)}
+  main{padding:18px 26px 60px}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:14px;margin-bottom:16px;overflow:hidden}
+  section h2{margin:0;padding:13px 16px;font-size:13.5px;font-weight:620;border-bottom:1px solid var(--line)}
+  section h2 span{color:var(--muted);font-weight:400;font-size:12px;margin-left:8px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:9px 16px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:500;font-size:11.5px;letter-spacing:.04em;white-space:nowrap}
+  tbody tr:last-child td{border-bottom:0}
+  tbody tr:hover{background:var(--panel2)}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .person{padding:14px 16px;border-bottom:1px solid var(--line)}
+  .person:last-child{border-bottom:0}
+  .person h3{margin:0 0 10px;font-size:14px;font-weight:640}
+  .buckets{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+  .bucket{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:11px 13px}
+  .bucket .cur{color:var(--muted);font-size:11px;letter-spacing:.06em}
+  .bucket .net{font-size:19px;font-weight:640;margin:5px 0 3px;font-variant-numeric:tabular-nums}
+  .bucket .io{color:var(--muted);font-size:11.5px}
+  .in{color:var(--in)} .out{color:var(--out)}
+  .tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;border:1px solid var(--line);color:var(--muted)}
+  .tag.exact{color:var(--in);border-color:#1d4029}
+  .tag.derived{color:#d9a441;border-color:#4a3a17}
+  .tag.uncertain{color:var(--out);border-color:#4a2620}
+  code{background:var(--panel2);border-radius:5px;padding:1.5px 6px;font-size:12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#c9d1ff}
+  .q{display:flex;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line)}
+  .q:last-child{border-bottom:0}
+  .q .id{color:var(--brand);font-family:ui-monospace,monospace;font-size:12px;min-width:44px}
+  .q .a{color:var(--muted);font-size:12.5px;margin-top:3px}
+  .empty{padding:22px 16px;color:var(--muted)}
+  .note{padding:12px 16px;color:var(--muted);font-size:12.5px;background:var(--panel2)}
+  .muted{color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <h1>记账看板</h1>
+  <div class="sub" id="meta">加载中…</div>
+</header>
+<nav>
+  <button data-t="overview" class="on">总览</button>
+  <button data-t="calendar">扣款日历</button>
+  <button data-t="txns">流水</button>
+  <button data-t="questions">待确认</button>
+</nav>
+<main id="view"></main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const api = (p) => fetch('/api/' + p).then(r => r.json());
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const SYM = { CNY:'¥', USD:'US$', THB:'THB ', EUR:'€' };
+const money = (cents, cur) => {
+  if (cents == null) return '—';
+  const v = (cents / 100).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+  return (SYM[cur] || (cur ? cur + ' ' : '')) + v;
+};
+let STATE = { overview:null, txns:null, questions:null };
+
+async function load() {
+  const [overview, txns, questions] = await Promise.all([api('overview'), api('transactions'), api('questions')]);
+  STATE = { overview, txns, questions };
+  $('#meta').textContent =
+    `${overview.accounts.length} 个账户 · ${overview.recurring.length} 个订阅 · ${overview.open_questions} 项待确认 · schema v${overview.schema_version} · 主币种 ${overview.primary_currency} · 数据更新于 ${overview.generated_at}`;
+}
+
+function viewOverview() {
+  const byOwner = new Map();
+  for (const a of STATE.overview.accounts) {
+    const owner = a.owner || '（未指定）';
+    if (!byOwner.has(owner)) byOwner.set(owner, []);
+    byOwner.get(owner).push(a);
+  }
+  const blocks = [...byOwner.entries()].map(([owner, accts]) => {
+    const buckets = accts.map(a => `
+      <div class="bucket">
+        <div class="cur">${esc(a.name)} · ${esc(a.currency || '—')} <span class="muted">(${esc(a.kind)})</span></div>
+        <div class="net ${a.net_cents >= 0 ? 'in' : 'out'}">${money(a.net_cents, a.currency)}</div>
+        <div class="io">收 ${money(a.income_cents, a.currency)} · 支 ${money(a.expense_cents, a.currency)} · ${a.transactions} 笔</div>
+      </div>`).join('');
+    return `<div class="person"><h3>${esc(owner)}</h3><div class="buckets">${buckets}</div></div>`;
+  }).join('');
+  $('#view').innerHTML = `
+    <section><h2>按人的账 <span>一个「人 × 一种币种」= 一个账户，天然不会跨币种相加</span></h2>
+      ${blocks || '<div class="empty">还没有账户</div>'}
+      <div class="note">「我」是真实个人支出；「晓青 / F哥」是我代付/垫付的账，他们打回来的钱是对垫付的补偿，不是收入或利润。</div>
+    </section>`;
+}
+
+function viewCalendar() {
+  const rows = [...STATE.overview.recurring].sort((a, b) => (a.day_of_month || 0) - (b.day_of_month || 0))
+    .map(r => `<tr>
+      <td class="num" style="font-weight:640">每月 ${r.day_of_month ?? '—'} 日</td>
+      <td>${esc(r.name)}</td>
+      <td>${esc(r.account)}</td>
+      <td class="muted">${esc(r.category || '—')}</td>
+      <td class="num">${money(r.amount_cents, (r.account.split('-')[1] || ''))}</td>
+      <td class="muted">下次 ${esc(r.next_due_on)}</td></tr>`).join('');
+  $('#view').innerHTML = `<section><h2>每月扣款日历 <span>${STATE.overview.recurring.length} 个订阅</span></h2>
+    <table><thead><tr><th class="num">扣款日</th><th>订阅</th><th>账户</th><th>分类</th><th class="num">金额</th><th>下次</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="empty">还没有订阅</td></tr>'}</tbody></table>
+    <div class="note">金额单位 = 该账户的币种。晓青那条是泰铢实扣（两次均值 3639）。</div></section>`;
+}
+
+function viewTxns() {
+  const rows = STATE.txns.map(t => `<tr>
+      <td><code>C-${String(t.id).padStart(4,'0')}</code>${t.external_ref ? '' : ''}</td>
+      <td class="num">${esc(t.date)}</td>
+      <td class="${t.kind === 'income' ? 'in' : 'out'}">${t.kind === 'income' ? '收' : '支'}</td>
+      <td class="num">${money(t.amount_cents, (t.account.split('-')[1] || ''))}</td>
+      <td>${esc(t.account)}</td>
+      <td class="muted">${esc(t.category || '—')}</td>
+      <td>${t.source ? `<span class="tag">${esc(t.source)}</span>` : ''}
+          ${t.confidence ? `<span class="tag ${esc(t.confidence)}">${esc(t.confidence)}</span>` : ''}</td>
+      <td class="muted">${esc(t.note || '')}</td></tr>`).join('');
+  $('#view').innerHTML = `<section><h2>流水 <span>${STATE.txns.length} 笔</span></h2>
+    <table><thead><tr><th>编号</th><th class="num">日期</th><th>方向</th><th class="num">金额</th>
+      <th>账户</th><th>分类</th><th>溯源</th><th>说明</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="8" class="empty">还没有流水</td></tr>'}</tbody></table>
+    <div class="note">每笔都带溯源：<code>source</code>（谁写的）、<code>confidence</code>（凭证明确/推算/待确认）、<code>external_ref</code>（幂等键，重发不会重复记账）。</div></section>`;
+}
+
+function viewQuestions() {
+  const open = STATE.questions.filter(q => q.status === 'open');
+  const closed = STATE.questions.filter(q => q.status !== 'open');
+  const item = q => `<div class="q"><div class="id">#${q.id}</div><div>
+      <div>${esc(q.question)} ${q.scope ? `<span class="tag">${esc(q.scope)}</span>` : ''}</div>
+      ${q.impact ? `<div class="a">影响：${esc(q.impact)}</div>` : ''}
+      ${q.answer ? `<div class="a">✅ ${esc(q.answer)}</div>` : ''}
+    </div></div>`;
+  $('#view').innerHTML = `
+    <section><h2>待确认 <span>${open.length} 项</span></h2>${open.map(item).join('') || '<div class="empty">没有待确认项 🎉</div>'}</section>
+    <section><h2>已关闭 <span>${closed.length} 项</span></h2>${closed.map(item).join('') || '<div class="empty">无</div>'}</section>`;
+}
+
+const TABS = { overview: viewOverview, calendar: viewCalendar, txns: viewTxns, questions: viewQuestions };
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  TABS[b.dataset.t]();
+});
+
+load().then(viewOverview);
+</script>
+</body>
+</html>

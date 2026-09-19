@@ -109,17 +109,41 @@ dry_run               → would_insert:2，库内 0 笔
 questions.ask → list → answer → 关闭后不再出现在 open 列表
 ```
 
-**测试：136 passed / 0 failed**（`tests/api.rs` 13 个用例专门固定这套契约）。
+**测试：138 passed / 0 failed**（`tests/api.rs` 13 个 + `tests/serve.rs` 2 个契约用例）。
+
+## 改动 3：`helius serve` 本地只读看板 ✅ 已完成
+
+人类入口。**手写 HTTP/1.1**（只用 `std::net` + 已有的 `serde_json`），不引新 crate。
+
+```bash
+helius --db cost/helius.db serve --port 8787   # → http://127.0.0.1:8787
+```
+
+- 路由：`/`（页面）、`/api/overview`、`/api/transactions`、`/api/questions`
+- **只监听 127.0.0.1**、**只读**（每次请求新开一个只读连接，绝不写库）
+- 页面按 **人 × 币种** 分桶展示，天然不会跨币种相加
+- 流水带溯源徽章（`source` / `confidence` / `external_ref`）
+
+## 改动 4：数据迁移 ✅ 已完成（数据在本地，不入库）
+
+`cost/migrate-to-helius.mjs`（在 `cost/` 内，含个人财务数据，**不进公开仓库**）：
+
+- **幂等键 = 原编号 C-00XX** → 反复重跑安全（实测重跑 `deduped:11, inserted:0`）
+- 建模：一个「人 × 一种币种」= 一个账户
+- 有意跳过 6 笔并逐条说明理由（4 笔 ¥10 取消单不是真实支出、1 笔起订事件已表达为 recurring rule、
+  1 笔币种不一致 → 转成 question 等泰铢原额）
+- **对账结果：新旧账 1:1 一致**（¥560 / ¥4000 / THB 7278.04 / ¥2000 / US$222）
 
 ## 待办路线图
 
 | 优先级 | 事项 | 说明 |
 |:---|:---|:---|
-| ~~N3~~ ✅ | ~~`tx.batch` + `questions.*`~~ | 已完成：批量原子 + 挂号 |
+| ~~N3~~ ✅ | ~~`tx.batch` + `questions.*`~~ | 批量原子 + 挂号 |
+| ~~N5~~ ✅ | ~~`helius serve`~~ | 本地只读看板 |
+| ~~N6~~ ✅ | ~~数据迁移~~ | 新旧账 1:1 对齐 |
 | **N4** | `helius mcp` | MCP stdio server，让支持的 agent 原生 tool 调用（薄适配层，复用 api 方法层） |
-| **P1** | 报表按人分组 | `owner` 列已在库里，还差按 owner 聚合 —— 「晓青这条线垫了多少、收回多少」 |
-| **N5** | `helius serve` 网页界面 | 人类看板 + dry-run 计划的确认入口。做进 Rust 二进制（单程序），只听 127.0.0.1 |
-| **N6** | 数据迁移 | 把 `cost/` 现有 17 笔流水 + 5 个订阅灌进 Helius 库（用幂等键，天然可重跑） |
+| **P1** | 报表按人分组 | `owner` 已在库里且页面已按人分桶；还差 CLI/JSON 侧按 owner 聚合 |
+| **P2** | `serve` 上的人工确认 | 目前看板只读；下一步让 dry-run 计划能在页面上确认后落库 |
 | **收尾** | 停用我自建的 `cost/db/`（Node + 自写 schema） | 避免两套真相。迁移完成后它只留作历史参考 |
 
 ## 使用方式

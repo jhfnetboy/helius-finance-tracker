@@ -100,7 +100,8 @@
 
 - **`helius api`**：最通用。任何能执行进程的 agent 都能用，不依赖 MCP 生态。
 - **`helius mcp`**：把同一批方法暴露成 MCP tools，供支持的 agent 原生调用。
-- **`helius serve`**：人类界面，且是 dry-run 计划的**确认入口**。
+- **`helius serve`**：人类界面（本地只读看板），也是 dry-run 计划的**确认入口**。
+  手写 HTTP/1.1，只用 `std::net` + 已有的 `serde_json` —— **不引新依赖**，保住"单二进制"。
 
 ## 4. 信任模型
 
@@ -120,8 +121,8 @@
 | **N2** | `helius api`：信封 + 错误码 + 退出码 + 方法分发；`schema.describe`、`accounts.list`、`tx.list`、`summary`、`tx.add`（幂等 + dry_run + 溯源） | ✅ |
 | **N3** | `tx.batch`（A3 批量原子）与 `questions.*`（A6 挂号） | ✅ |
 | **N4** | `helius mcp`（MCP stdio server，薄适配层） | ⬜ |
-| **N5** | `helius serve` 网页界面 + dry-run 确认入口 | ⬜ |
-| **N6** | 迁移 `cost/` 现有数据（用幂等键，天然可重跑） | ⬜ |
+| **N5** | `helius serve` 网页界面（人类入口） | ✅ |
+| **N6** | 迁移现有数据（用幂等键，天然可重跑） | ✅ 数据在本地 `cost/`，不入公开仓库 |
 
 ### A3 批量原子的语义
 
