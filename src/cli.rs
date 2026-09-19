@@ -19,6 +19,8 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Shell,
+    /// Agent-native JSON 入口：读一个请求信封，写一个响应信封
+    Api(ApiArgs),
     Init(InitArgs),
     Account {
         #[command(subcommand)]
@@ -87,6 +89,13 @@ pub enum AccountCommand {
     Edit(AccountEditArgs),
     Delete(AccountDeleteArgs),
     List(AccountListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ApiArgs {
+    /// 从文件读取 JSON 请求；`-` 或省略则读 stdin
+    #[arg(long)]
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Args)]

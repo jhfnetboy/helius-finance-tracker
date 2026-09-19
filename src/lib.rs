@@ -1,3 +1,4 @@
+pub mod api;
 mod amount;
 mod cli;
 mod db;
@@ -11,7 +12,7 @@ mod theme;
 mod ui;
 
 pub use crate::db::{Db, CURRENT_SCHEMA_VERSION};
-pub use crate::model::{Account, AccountKind, TransactionFilters};
+pub use crate::model::{Account, AccountKind, CategoryKind, TransactionFilters};
 
 use std::ffi::OsString;
 use std::io::{BufRead, IsTerminal, Write};
@@ -22,7 +23,7 @@ use clap::{CommandFactory, Parser};
 
 use crate::amount::{parse_amount_to_cents, parse_balance_to_cents};
 use crate::cli::{
-    AccountAddArgs, AccountCommand, AccountDeleteArgs, AccountEditArgs, BalanceArgs, BudgetCommand,
+    AccountAddArgs, ApiArgs, AccountCommand, AccountDeleteArgs, AccountEditArgs, BalanceArgs, BudgetCommand,
     BudgetDeleteArgs, BudgetListArgs, BudgetSetArgs, BudgetStatusArgs, CategoryAddArgs,
     CategoryCommand, CategoryDeleteArgs, CategoryEditArgs, Cli, Command, ExportCommand,
     ExportCsvArgs, ForecastBillsArgs, ForecastCommand, ForecastShowArgs, GoalAddArgs, GoalCommand,
@@ -163,6 +164,7 @@ fn run_command(db_path: &Path, command: Command, stdout: &mut dyn Write) -> Resu
     match command {
         Command::Shell => shell::run_interactive_shell(db_path.to_path_buf(), stdout),
         Command::Init(args) => handle_init(db_path, args, stdout),
+        Command::Api(args) => with_existing_db(db_path, |db| handle_api(db, args, stdout)),
         Command::Account { command } => {
             with_existing_db(db_path, |db| handle_account(db, command, stdout))
         }
@@ -229,6 +231,28 @@ fn handle_init(db_path: &Path, args: InitArgs, stdout: &mut dyn Write) -> Result
             args.currency.trim().to_ascii_uppercase()
         ))
     )?;
+    Ok(())
+}
+
+/// `helius api` —— 从 stdin 或 --file 读一个 JSON 请求信封，写一个 JSON 响应。
+/// 这是 agent 的主入口：单次进程、无 TTY、无颜色、无交互。
+fn handle_api(db: Db, args: ApiArgs, stdout: &mut dyn Write) -> Result<(), AppError> {
+    use std::io::Read;
+
+    let mut input = String::new();
+    match args.file.as_deref() {
+        Some(path) if path != "-" => input = std::fs::read_to_string(path)?,
+        _ => {
+            std::io::stdin().read_to_string(&mut input)?;
+        }
+    }
+
+    let (output, code) = crate::api::handle(&db, &input);
+    writeln!(stdout, "{output}")?;
+    stdout.flush()?;
+    if code != crate::api::EXIT_OK {
+        std::process::exit(code);
+    }
     Ok(())
 }
 

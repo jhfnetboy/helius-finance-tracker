@@ -21,7 +21,23 @@ use crate::model::{
     UpdatePlanningScenario, UpdateRecurringRule, UpdateTransaction, Weekday, WeeklyBalancePoint,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 10;
+pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+
+/// 一笔流水的溯源信息（agent-native 契约 A5）。
+/// 字段全可空 —— 人手工记的账不必填。
+#[derive(Clone, Debug, Default)]
+pub struct TransactionProvenance {
+    /// 幂等键 / 原始单号（UNIQUE，重发不会重复记账）
+    pub external_ref: Option<String>,
+    /// agent / human / import
+    pub source: Option<String>,
+    /// 凭证路径，例如 cost/sources/2026-09-19-deepseek.webp
+    pub evidence: Option<String>,
+    /// 写入方会话标识
+    pub session: Option<String>,
+    /// exact / derived / uncertain
+    pub confidence: Option<String>,
+}
 
 pub struct Db {
     conn: Connection,
@@ -3873,6 +3889,43 @@ impl Db {
         if self.schema_version()? < 10 {
             self.migrate_v9_to_v10()?;
         }
+        if self.schema_version()? < 11 {
+            self.migrate_v10_to_v11()?;
+        }
+        Ok(())
+    }
+
+    /// v11 — 溯源与幂等（agent-native 的基础）
+    ///
+    /// agent 会重发同一张截图，所以每笔流水需要：
+    /// - `external_ref`：幂等键 / 原始单号，**唯一索引**保证不会重复记账
+    /// - `source` / `evidence` / `session` / `confidence`：可回溯"谁写的、依据什么"
+    ///
+    /// 全部可空 —— 人手工记的账不需要填，也不影响既有语义。
+    fn migrate_v10_to_v11(&mut self) -> Result<(), AppError> {
+        let existing: Vec<String> = {
+            let mut statement = self.conn.prepare("PRAGMA table_info(transactions)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns
+        };
+        let mut statements = String::from("BEGIN;");
+        for column in ["source", "evidence", "session", "external_ref", "confidence"] {
+            if !existing.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+                statements.push_str(&format!(
+                    "ALTER TABLE transactions ADD COLUMN {column} TEXT;"
+                ));
+            }
+        }
+        // 同名幂等键只能有一条未删除的流水
+        statements.push_str(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_external_ref
+                 ON transactions(external_ref) WHERE external_ref IS NOT NULL;
+             UPDATE metadata SET schema_version = 11 WHERE id = 1;
+             COMMIT;",
+        );
+        self.conn.execute_batch(&statements)?;
         Ok(())
     }
 
@@ -4235,6 +4288,8 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_transactions_category_date ON transactions(category_id, txn_date);
              CREATE INDEX IF NOT EXISTS idx_transactions_reconciliation ON transactions(reconciliation_id);
              CREATE INDEX IF NOT EXISTS idx_transactions_recurring_rule ON transactions(recurring_rule_id);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_external_ref
+                 ON transactions(external_ref) WHERE external_ref IS NOT NULL;
              CREATE INDEX IF NOT EXISTS idx_reconciliations_account_date ON reconciliations(account_id, statement_ending_on);
              CREATE INDEX IF NOT EXISTS idx_recurring_rules_next_due ON recurring_rules(next_due_on);
              CREATE INDEX IF NOT EXISTS idx_recurring_occurrences_due_status ON recurring_occurrences(due_on, status);
@@ -4507,6 +4562,66 @@ impl Db {
         }
 
         Ok(())
+    }
+
+    /// agent 写入时附带的溯源信息（全部可空）。
+    pub fn set_transaction_provenance(
+        &self,
+        transaction_id: i64,
+        provenance: &TransactionProvenance,
+    ) -> Result<(), AppError> {
+        self.conn.execute(
+            "UPDATE transactions
+             SET external_ref = ?2, source = ?3, evidence = ?4, session = ?5, confidence = ?6
+             WHERE id = ?1",
+            params![
+                transaction_id,
+                provenance.external_ref,
+                provenance.source,
+                provenance.evidence,
+                provenance.session,
+                provenance.confidence
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 读回一笔流水的溯源信息（测试与审计用）。
+    pub fn transaction_provenance(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Option<TransactionProvenance>, AppError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT external_ref, source, evidence, session, confidence
+                 FROM transactions WHERE id = ?1",
+                params![transaction_id],
+                |row| {
+                    Ok(TransactionProvenance {
+                        external_ref: row.get(0)?,
+                        source: row.get(1)?,
+                        evidence: row.get(2)?,
+                        session: row.get(3)?,
+                        confidence: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// 按幂等键找未删除的流水。agent 重发时用它判断"是不是已经记过了"。
+    pub fn find_transaction_by_external_ref(&self, external_ref: &str) -> Result<Option<i64>, AppError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM transactions
+                 WHERE external_ref = ?1 AND deleted_at IS NULL
+                 LIMIT 1",
+                params![external_ref],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?)
     }
 
     /// 区间内出现过的生效币种（账户自带优先，否则主币种）。
@@ -5163,6 +5278,12 @@ CREATE TABLE IF NOT EXISTS transactions (
     deleted_at TEXT,
     recurring_rule_id INTEGER REFERENCES recurring_rules(id),
     reconciliation_id INTEGER REFERENCES reconciliations(id),
+    -- v11：溯源与幂等（agent-native）
+    external_ref TEXT,
+    source TEXT,
+    evidence TEXT,
+    session TEXT,
+    confidence TEXT,
     CHECK (
         (kind IN ('income', 'expense') AND to_account_id IS NULL AND category_id IS NOT NULL)
         OR
