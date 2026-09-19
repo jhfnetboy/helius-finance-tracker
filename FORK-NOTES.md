@@ -4,6 +4,23 @@
 > 本地路径：`cost/tools/helius/`（在 `.gitignore` 的 `cost/` 内，不会污染 Brood 仓库）
 > 为什么选它：Rust + `rusqlite` 的 `bundled` feature → **真·单二进制自带 SQLite**；CLI + TUI；`recurring_rules` 正好是"每月几号扣多少"。
 
+## 仓库位置与同步
+
+| remote | 仓库 | 说明 |
+|:---|:---|:---|
+| `origin` | https://github.com/jhfnetboy/helius-finance-tracker | **我们自己的 fork**（public，`main` 跟踪它） |
+| `upstream` | https://github.com/Helius-Finance/helius-finance-tracker | 官方上游 |
+
+```bash
+# 跟进官方更新
+git fetch upstream && git merge upstream/main
+git push origin main
+```
+
+> ⚠️ 这是一个**公开**仓库。账本数据库（`*.db` / `*.sqlite*`）已被上游 `.gitignore` 排除，
+> 个人流水**不会**进入 git —— 但每次 `git add` 前仍建议 `git status` 扫一眼。
+> 顺便：上游是 **AGPL-3.0-only**，自己用没问题；对外分发/对外提供服务则必须开源。
+
 ## 编译方式（macOS）
 
 沙箱不允许写 `~/.cargo`，所以把 CARGO_HOME 放进工作区：
